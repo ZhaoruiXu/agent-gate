@@ -1,0 +1,48 @@
+# virtualenv, bytecode, secrets
+.venv/
+__pycache__/
+*.pyc
+.env
+# runtime state (regenerated)
+sandbox/
+data/
+audit/
+
+# runtime state (regenerated)
+memory/
+metrics/
+
+# build artifacts
+*.egg-info/
+src/*.egg-info/
+
+# env variants (keep .env.example tracked)
+.env.*
+!.env.example
+
+# keys, certs, credentials
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+*credentials*
+*secret*
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# build / test outputs
+dist/
+build/
+*.whl
+*.tar.gz
+*.log
+*.jsonl
+venv/
+env/
+.coverage
+htmlcov/
