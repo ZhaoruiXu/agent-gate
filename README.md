@@ -170,7 +170,7 @@ how expensive".
 
 ## Eval results
 
-`evals/run_evals.py` runs 46 checks (no API key needed):
+`evals/run_evals.py` runs 50 checks (no API key needed):
 
 | case | what it proves | result |
 |---|---|---|
