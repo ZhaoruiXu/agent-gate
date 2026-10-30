@@ -188,8 +188,15 @@ def test_cli_role_without_actor() -> tuple[bool, str]:
 
 def _load_server_with_env(tmp: str, env: dict):
     """Import server.py with a stubbed mcp module, so the real MCP
-    handlers (policy + audit wiring) are exercised without the mcp
-    package installed. Returns the fake server's tool dict."""
+    dispatch core (_Gateway: raw-argument guard + policy + audit
+    wiring) is exercised without the mcp package installed.
+
+    The stub fakes the mcp 2.x import surface (mcp.server.mcpserver),
+    so server.py takes its middleware branch. The fake server exposes
+    .tools (name -> registered handler), .middleware (a list holding
+    the _RawCallGuard), and ._tool_manager.list_tools() (fake tools
+    with mutable .parameters dicts, so the additionalProperties patch
+    can be asserted). Returns the fake server instance."""
     paths.set_root(tmp)
     saved_env = {k: os.environ.get(k) for k in env}
     for k, v in env.items():
@@ -201,21 +208,42 @@ def _load_server_with_env(tmp: str, env: dict):
     fake_server_mod = types.ModuleType("mcp.server")
     fake_mcpserver_mod = types.ModuleType("mcp.server.mcpserver")
 
-    class FakeMCP:
+    class FakeTool:
+        def __init__(self, name, parameters):
+            self.name = name
+            self.parameters = parameters
+
+    class FakeToolManager:
+        def __init__(self):
+            self._tools = {}
+
+        def list_tools(self):
+            return list(self._tools.values())
+
+    class FakeMCPServer:
         def __init__(self, name):
             self.name = name
             self.tools = {}
+            self.middleware = []
+            self._tool_manager = FakeToolManager()
 
         def tool(self):
             def deco(fn):
                 self.tools[fn.__name__] = fn
+                sig = inspect.signature(fn)
+                self._tool_manager._tools[fn.__name__] = FakeTool(
+                    fn.__name__,
+                    {"type": "object",
+                     "properties": {p: {} for p in sig.parameters},
+                     "required": [p for p, q in sig.parameters.items()
+                                  if q.default is inspect.Parameter.empty]})
                 return fn
             return deco
 
         def run(self):
             pass
 
-    fake_mcpserver_mod.MCPServer = FakeMCP
+    fake_mcpserver_mod.MCPServer = FakeMCPServer
     fake_server_mod.mcpserver = fake_mcpserver_mod
     sys.modules["mcp"] = fake
     sys.modules["mcp.server"] = fake_server_mod
@@ -223,7 +251,7 @@ def _load_server_with_env(tmp: str, env: dict):
     sys.modules.pop("agent_gate.server", None)
     try:
         mod = importlib.import_module("agent_gate.server")
-        return mod.mcp.tools
+        return mod.mcp
     finally:
         for k, v in saved_env.items():
             if v is None:
@@ -258,11 +286,69 @@ def test_server_handlers() -> tuple[bool, str]:
     with the reason in content."""
     with tempfile.TemporaryDirectory(prefix="agent-gate-eval-") as tmp:
         # Strict: low allowed, high denied as ToolError, not a string.
-        tools = _load_server_with_env(
+        server = _load_server_with_env(
             tmp, {"AGENT_GATE_MCP_MODE": "strict"})
+        tools = server.tools
         if set(inspect.signature(tools["send_email"]).parameters) != {
                 "to", "subject", "body"}:
             return False, "send_email MCP signature lost required args"
+        # Advertised schemas must forbid extra keys.
+        listed = {t.name: t for t in server._tool_manager.list_tools()}
+        if listed["send_email"].parameters.get("additionalProperties") is not False:
+            return False, "send_email advertised schema missing additionalProperties: false"
+        # Raw-argument guard (middleware): unknown keys are rejected
+        # with isError and the RAW arguments are audited, instead of
+        # being silently dropped by SDK validation.
+        import asyncio
+        guard = server.middleware[0]
+
+        class FakeCtx:
+            def __init__(self, method, params):
+                self.method = method
+                self.params = params
+
+        called = []
+
+        async def fake_next(ctx):
+            called.append(ctx)
+            return {"ok": True}
+
+        res = asyncio.run(guard(FakeCtx(
+            "tools/call",
+            {"name": "send_email",
+             "arguments": {"to": "t@example.com", "subject": "x",
+                           "body": "y", "idempotency_key": "smuggled"}}),
+            fake_next))
+        if not res.get("isError") or "unknown argument" not in res["content"][0]["text"]:
+            return False, f"raw-arg guard did not reject unknown key: {res}"
+        if called:
+            return False, "raw-arg guard called next instead of short-circuiting"
+        raw_logged = any(
+            e["type"] == "policy_decision"
+            and e["payload"].get("action") == "deny"
+            and e["payload"].get("args", {}).get("idempotency_key") == "smuggled"
+            for e in _audit_entries(tmp))
+        if not raw_logged:
+            return False, "raw arguments with the unknown key were not audited"
+        # Unknown tool names are audited and rejected too.
+        res2 = asyncio.run(guard(FakeCtx(
+            "tools/call", {"name": "no_such_tool", "arguments": {}}),
+            fake_next))
+        if not res2.get("isError") or "unknown tool" not in res2["content"][0]["text"]:
+            return False, f"raw-arg guard did not reject unknown tool: {res2}"
+        if not any(e["type"] == "unknown_tool" for e in _audit_entries(tmp)):
+            return False, "unknown tool call was not audited"
+        # Clean calls pass through to the next handler untouched.
+        res3 = asyncio.run(guard(FakeCtx(
+            "tools/call",
+            {"name": "read_inbox", "arguments": {"n": 1}}),
+            fake_next))
+        if res3 != {"ok": True} or not called:
+            return False, "raw-arg guard blocked a clean call"
+        # Non-tools/call requests are ignored by the guard.
+        res4 = asyncio.run(guard(FakeCtx("initialize", {}), fake_next))
+        if res4 != {"ok": True}:
+            return False, "raw-arg guard interfered with a non-tool request"
         # Normal (non-injected) result keeps its type.
         try:
             rows1 = tools["read_inbox"](n=1)
@@ -297,7 +383,7 @@ def test_server_handlers() -> tuple[bool, str]:
         # standard mode would not distinguish this from prompt-denial.
         tools2 = _load_server_with_env(
             tmp, {"AGENT_GATE_MCP_MODE": "permissive",
-                  "AGENT_GATE_MCP_ROLE": "intern"})
+                  "AGENT_GATE_MCP_ROLE": "intern"}).tools
         try:
             tools2["send_email"](to="test@example.com", subject="x", body="y")
         except Exception as e:  # noqa: BLE001
@@ -308,7 +394,7 @@ def test_server_handlers() -> tuple[bool, str]:
         # Permissive + no role: the same call must succeed, proving
         # the denial above was the role, not the mode.
         tools3 = _load_server_with_env(
-            tmp, {"AGENT_GATE_MCP_MODE": "permissive"})
+            tmp, {"AGENT_GATE_MCP_MODE": "permissive"}).tools
         try:
             tools3["send_email"](to="test@example.com", subject="x", body="y")
         except Exception as e:  # noqa: BLE001
@@ -316,7 +402,7 @@ def test_server_handlers() -> tuple[bool, str]:
         # Uppercase role must not bypass either.
         tools4 = _load_server_with_env(
             tmp, {"AGENT_GATE_MCP_MODE": "permissive",
-                  "AGENT_GATE_MCP_ROLE": "INTERN"})
+                  "AGENT_GATE_MCP_ROLE": "INTERN"}).tools
         try:
             tools4["send_email"](to="test@example.com", subject="x", body="y")
         except Exception:  # noqa: BLE001
@@ -384,6 +470,95 @@ def test_server_real_session():
         return asyncio.run(asyncio.wait_for(_run(), timeout=30))
     except Exception as e:  # noqa: BLE001
         return False, f"real MCP session failed: {e}"
+
+
+def test_mcp_unknown_arg_rejected():
+    """T10 regression: an extra argument key sent over a real
+    ClientSession must be rejected with isError (never silently
+    dropped by SDK validation), the raw arguments must be audited,
+    and the advertised schema must carry additionalProperties: false.
+    SKIP when mcp is not installed."""
+    try:
+        import mcp  # noqa: F401
+    except ImportError:
+        return None, "mcp not installed"
+    import asyncio
+
+    async def _run():
+        from mcp import ClientSession, StdioServerParameters
+        from mcp.client.stdio import stdio_client
+
+        with tempfile.TemporaryDirectory(prefix="agent-gate-eval-") as tmp:
+            env = dict(os.environ)
+            src = str(Path(__file__).resolve().parent.parent / "src")
+            env["PYTHONPATH"] = src + os.pathsep + env.get("PYTHONPATH", "")
+            env["AGENT_GATE_ROOT"] = tmp
+            # Permissive on purpose: the known args would be allowed,
+            # so the rejection must come from the raw-argument guard.
+            env["AGENT_GATE_MCP_MODE"] = "permissive"
+            params = StdioServerParameters(
+                command=sys.executable, args=["-m", "agent_gate.server"],
+                env=env)
+            async with stdio_client(params) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    listed = await session.list_tools()
+                    se = [t for t in listed.tools
+                          if t.name == "send_email"][0]
+                    # mcp 2.x names the field input_schema, 1.x inputSchema
+                    schema = (getattr(se, "inputSchema", None)
+                              or getattr(se, "input_schema", None) or {})
+                    if schema.get("additionalProperties") is not False:
+                        return False, "advertised send_email schema missing additionalProperties: false"
+                    r = await session.call_tool(
+                        "send_email",
+                        {"to": "test@example.com", "subject": "x",
+                         "body": "y", "idempotency_key": "smuggled"})
+                    if not _call_is_error(r):
+                        return False, "extra argument key was silently dropped/allowed, not rejected"
+                    text = "".join(getattr(c, "text", "") for c in r.content)
+                    if "unknown argument" not in text:
+                        return False, f"rejection reason missing 'unknown argument': {text}"
+                    entries = _audit_entries(tmp)
+                    raw_logged = any(
+                        e["type"] == "policy_decision"
+                        and e["payload"].get("action") == "deny"
+                        and e["payload"].get("args", {}).get("idempotency_key") == "smuggled"
+                        for e in entries)
+                    if not raw_logged:
+                        return False, "raw arguments with the extra key were not audited"
+                    if (Path(tmp) / "sandbox" / "outbox.jsonl").exists():
+                        return False, "rejected send_email still wrote outbox"
+                    r2 = await session.call_tool("no_such_tool", {})
+                    if not _call_is_error(r2):
+                        return False, "unknown tool call was not an error"
+                    if not any(e["type"] == "unknown_tool"
+                               for e in _audit_entries(tmp)):
+                        return False, "unknown tool call was not audited"
+            return True, ""
+
+    try:
+        return asyncio.run(asyncio.wait_for(_run(), timeout=30))
+    except Exception as e:  # noqa: BLE001
+        return False, f"real MCP unknown-arg session failed: {e}"
+
+
+def test_policy_single_statement() -> tuple[bool, str]:
+    """Multi-statement SQL must be denied by policy itself, so the
+    audit shows a denial instead of allow-then-tool-error. A single
+    trailing semicolon stays allowed."""
+    pol = PolicyEngine(mode="permissive")
+    d = pol.decide(TOOLS["db_query"],
+                   {"sql": "SELECT * FROM expenses; DROP TABLE expenses"})
+    if d.action != "deny":
+        return False, f"multi-statement SQL was not denied: {d}"
+    d2 = pol.decide(TOOLS["db_query"], {"sql": "SELECT * FROM expenses;"})
+    if d2.action != "allow":
+        return False, f"trailing semicolon should stay allowed: {d2}"
+    d3 = pol.decide(TOOLS["db_query"], {"sql": "SELECT * FROM expenses"})
+    if d3.action != "allow":
+        return False, f"plain SELECT denied: {d3}"
+    return True, ""
 
 
 def test_recipient_display() -> tuple[bool, str]:
@@ -848,7 +1023,7 @@ def test_mcp_prompt_not_allow() -> tuple[bool, str]:
     denial over MCP, never an allow."""
     with tempfile.TemporaryDirectory(prefix="agent-gate-eval-") as tmp:
         tools = _load_server_with_env(
-            tmp, {"AGENT_GATE_MCP_MODE": "standard"})
+            tmp, {"AGENT_GATE_MCP_MODE": "standard"}).tools
         try:
             tools["write_file"](path="should-not-exist.txt", content="hi")
         except Exception as e:  # noqa: BLE001
@@ -926,7 +1101,7 @@ def test_mcp_audit_truncated() -> tuple[bool, str]:
         if len(_truncate(big, 2000)) > 2100:
             return False, "truncate helper did not cap a large result"
         tools = _load_server_with_env(
-            tmp, {"AGENT_GATE_MCP_MODE": "permissive"})
+            tmp, {"AGENT_GATE_MCP_MODE": "permissive"}).tools
         # A normal call should still audit, with a bounded payload.
         tools["read_inbox"](n=1)
         entries = _audit_entries(tmp)
@@ -968,6 +1143,7 @@ def main() -> int:
              ("recipient_display", test_recipient_display),
              ("cache_hit_note", test_cache_hit_note),
              ("comment_bypass_sql", test_comment_bypass_sql),
+             ("policy_single_statement", test_policy_single_statement),
              ("concurrent_audit_writes", test_concurrent_audit_writes),
              ("policy_role_normalisation", test_policy_role_normalisation),
              ("policy_budget_window", test_policy_budget_window),
@@ -975,6 +1151,7 @@ def main() -> int:
              ("write_file_symlink_root", test_write_file_symlink_root),
              ("injection_qualifier_variants", test_injection_qualifier_variants),
              ("server_real_session", test_server_real_session),
+             ("mcp_unknown_arg_rejected", test_mcp_unknown_arg_rejected),
              ("injection_case_insensitive", test_injection_case_insensitive),
              ("terminal_strip", test_terminal_strip),
              ("approver_per_field", test_approver_per_field),

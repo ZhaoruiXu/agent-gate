@@ -203,6 +203,13 @@ class PolicyEngine:
                 return Decision("deny", "db_query sql must be a string")
             if not sql.strip().lstrip("(").upper().startswith("SELECT"):
                 return Decision("deny", "db_query is read-only: only SELECT allowed")
+            # --- multi-statement: deny at the policy layer, so the
+            # audit shows a denial instead of allow-then-error. A single
+            # trailing semicolon is fine; anything else means stacked
+            # statements. (Conservative edge: a ";" inside a string
+            # literal also denies; this is a demo-grade read-only tool.)
+            if ";" in sql.strip().rstrip(";").rstrip():
+                return Decision("deny", "db_query must be a single statement")
         if tool.name in ("write_file", "delete_file"):
             rel = args.get("path", "")
             if not isinstance(rel, str):

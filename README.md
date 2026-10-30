@@ -68,7 +68,7 @@ cp .env.example .env   # optional: add ANTHROPIC_API_KEY for a real model
 # show aggregated observability across runs (latency, cost, per-tool stats)
 .venv/bin/python -m agent_gate.cli metrics
 
-# run the eval suite (46 checks, no API key needed)
+# run the eval suite (48 checks, no API key needed)
 .venv/bin/python evals/run_evals.py
 
 # expose the tools as an MCP server (stdio) for Claude Code / Claude Desktop
@@ -78,7 +78,12 @@ cp .env.example .env   # optional: add ANTHROPIC_API_KEY for a real model
 # An explicit ROLE without ACTOR is kept as unknown+role, never dropped.
 # The policy budget is per 60-second window, not per process lifetime,
 # so a long-lived MCP server recovers after a burst instead of denying
-# everything until restart.
+# everything until restart. The SDK validates arguments against the tool
+# schema and silently drops unknown keys before our code runs, so a
+# raw-argument guard inspects the wire arguments first (middleware on
+# mcp 2.x, an overridden call_tool on 1.x): unknown tools and unknown
+# argument keys are rejected with isError and the raw arguments are
+# audited. Advertised schemas carry additionalProperties: false.
 .venv/bin/python -m agent_gate.server
 ```
 
@@ -185,7 +190,7 @@ how expensive".
 | `injection_two_qualifier` | two-qualifier injection phrase is detected | ✅ PASS |
 | `cli_role_without_actor` | `--role intern` without `--actor` is kept, not dropped | ✅ PASS |
 
-| `server_handlers` | server.py handlers via a stubbed mcp module: allow, deny-as-ToolError, permissive intern role without actor, signature, audit entries, MCP injection flag/note | ✅ PASS |
+| `server_handlers` | server.py dispatch core via a stubbed mcp module: allow, deny-as-ToolError, permissive intern role without actor, signature, advertised additionalProperties:false, raw-arg guard (unknown key/tool rejected with isError and audited with raw args), audit entries, MCP injection flag/note | ✅ PASS |
 | `recipient_display` | approval prompt shows recipient with repr(), no raw carriage return | ✅ PASS |
 | `cache_hit_note` | cached injected tool result still carries the system note | ✅ PASS |
 | `comment_bypass_sql` | comment-hidden DROP is denied by SQLite, table survives | ✅ PASS |
@@ -197,6 +202,8 @@ how expensive".
 | `injection_qualifier_variants` | "your previous" and "the above" injection phrases detected | ✅ PASS |
 
 | `server_real_session` | real MCP ClientSession when mcp is installed, else SKIP (not PASS) | ✅ PASS |
+| `mcp_unknown_arg_rejected` | T10 regression: extra key over a real ClientSession is rejected with isError (not dropped), raw args audited, schema advertises additionalProperties:false, unknown tool audited; SKIP without mcp | ✅ PASS |
+| `policy_single_statement` | multi-statement SQL denied by policy itself (deny, not allow-then-error); trailing semicolon stays allowed | ✅ PASS |
 | `policy_unknown_arg` | unknown argument keys are denied by policy | ✅ PASS |
 | `approver_key_repr_and_to_full` | approval keys are repr()d, long recipient shown in full or denied over limit | ✅ PASS |
 | `terminal_c1_bidi_strip` | C1 controls and bidi overrides stripped from terminal output | ✅ PASS |
@@ -216,7 +223,7 @@ how expensive".
 | `delete_file_symlink_root` | delete under a symlinked root resolves both sides | ✅ PASS |
 | `scrub_value_narrow_to` | "to" kept only inside args; keys, sets and bytes scrubbed | ✅ PASS |
 
-46 checks, updated 2026-10-28 after the follow-up round. The idempotency explicit-key feature was removed in this round; see the idempotency section. The server test runs a real MCP ClientSession when the `mcp` package is installed (verified locally on mcp 1.30.0 and 2.3.0), and reports SKIP when it is not.
+48 checks, updated 2026-10-29 after the live MCP test round (raw-argument guard, unknown-tool audit, policy-level multi-statement SQL deny). The idempotency explicit-key feature was removed in an earlier round; see the idempotency section. The server tests run real MCP ClientSessions when the `mcp` package is installed (verified locally on mcp 1.30.0 and 2.3.0), and report SKIP when it is not.
 
 ## Requirements
 
