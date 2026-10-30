@@ -1,5 +1,7 @@
 # agent-gate
 
+[![evals](https://github.com/ZhaoruiXu/agent-gate/actions/workflows/evals.yml/badge.svg)](https://github.com/ZhaoruiXu/agent-gate/actions/workflows/evals.yml)
+
 A safe tool-calling harness.
 
 A **safe tool-calling agent** skeleton: the "tooling layer" that lets an LLM
@@ -68,7 +70,7 @@ cp .env.example .env   # optional: add ANTHROPIC_API_KEY for a real model
 # show aggregated observability across runs (latency, cost, per-tool stats)
 .venv/bin/python -m agent_gate.cli metrics
 
-# run the eval suite (50 checks, no API key needed)
+# run the eval suite (51 checks, no API key needed)
 .venv/bin/python evals/run_evals.py
 
 # expose the tools as an MCP server (stdio) for Claude Code / Claude Desktop
@@ -170,7 +172,7 @@ how expensive".
 
 ## Eval results
 
-`evals/run_evals.py` runs 50 checks (no API key needed):
+`evals/run_evals.py` runs 51 checks (no API key needed):
 
 | case | what it proves | result |
 |---|---|---|
@@ -208,6 +210,7 @@ how expensive".
 | `mcp_guard_malformed` | malformed tools/call envelopes (string args, non-string name, list-of-pairs args) are clean isError rejections with the Error-executing prefix, never leaked Python exceptions, and audited | ✅ PASS |
 | `mcp_guard_budget_charged` | guard rejections count against the rate budget: 25 unknown-tool rejections exhaust the budget of 20, the next legitimate call is denied | ✅ PASS |
 | `policy_single_statement` | multi-statement SQL denied by policy itself (deny, not allow-then-error); trailing semicolon stays allowed | ✅ PASS |
+| `no_skip_validation` | --no-skip with no names or an unknown name exits non-zero instead of silently doing nothing | ✅ PASS |
 | `policy_unknown_arg` | unknown argument keys are denied by policy | ✅ PASS |
 | `approver_key_repr_and_to_full` | approval keys are repr()d, long recipient shown in full or denied over limit | ✅ PASS |
 | `terminal_c1_bidi_strip` | C1 controls and bidi overrides stripped from terminal output | ✅ PASS |
@@ -227,7 +230,7 @@ how expensive".
 | `delete_file_symlink_root` | delete under a symlinked root resolves both sides | ✅ PASS |
 | `scrub_value_narrow_to` | "to" kept only inside args; keys, sets and bytes scrubbed | ✅ PASS |
 
-50 checks, updated 2026-10-29 after the live MCP test follow-ups (guard rejects malformed envelopes cleanly, guard rejections charge the rate budget, Error-executing prefix on guard denials). The idempotency explicit-key feature was removed in an earlier round; see the idempotency section. The server tests run real MCP ClientSessions when the `mcp` package is installed (verified locally on mcp 1.30.0 and 2.3.0), and report SKIP when it is not.
+51 checks, updated 2026-10-29 after the live MCP test follow-ups (guard rejects malformed envelopes cleanly, guard rejections charge the rate budget, Error-executing prefix on guard denials). The idempotency explicit-key feature was removed in an earlier round; see the idempotency section. The server tests run real MCP ClientSessions when the `mcp` package is installed (verified locally on mcp 1.30.0 and 2.3.0), and report SKIP when it is not.
 
 ## Requirements
 

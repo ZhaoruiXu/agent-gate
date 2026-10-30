@@ -662,6 +662,26 @@ def test_mcp_guard_budget_charged() -> tuple[bool, str]:
     return True, ""
 
 
+def test_no_skip_validation() -> tuple[bool, str]:
+    """--no-skip with no names or an unknown name must exit non-zero:
+    a typo'd name would otherwise silently do nothing."""
+    for argv in (["--no-skip"], ["--no-skip", "no_such_eval"]):
+        try:
+            _resolve_no_skip(argv, ["server_real_session"])
+        except SystemExit as e:
+            if e.code == 0:
+                return False, f"--no-skip misuse exited 0: {argv}"
+        else:
+            return False, f"--no-skip misuse did not exit: {argv}"
+    if _resolve_no_skip(
+            ["--no-skip", "server_real_session"],
+            ["server_real_session"]) != ["server_real_session"]:
+        return False, "valid --no-skip names were not returned"
+    if _resolve_no_skip([], ["server_real_session"]) != []:
+        return False, "missing --no-skip should return []"
+    return True, ""
+
+
 def test_recipient_display() -> tuple[bool, str]:
     """The approval prompt must show the recipient with repr(), so a
     carriage return cannot forge a different address on the terminal."""
@@ -1231,13 +1251,30 @@ def test_idempotency_key_dropped() -> tuple[bool, str]:
     return True, ""
 
 
+def _resolve_no_skip(argv: list[str], known: list[str]) -> list[str]:
+    """Parse --no-skip NAME ... from argv.
+
+    Exits non-zero when the flag is given with no names or with an
+    unknown eval name: a typo'd name would otherwise silently do
+    nothing, which is exactly the false-confidence CI is meant to
+    prevent."""
+    if "--no-skip" not in argv:
+        return []
+    names = argv[argv.index("--no-skip") + 1:]
+    if not names:
+        print("error: --no-skip requires at least one eval name",
+              file=sys.stderr)
+        raise SystemExit(2)
+    unknown = [n for n in names if n not in known]
+    if unknown:
+        print(f"error: unknown eval name(s) for --no-skip: "
+              f"{', '.join(unknown)}", file=sys.stderr)
+        raise SystemExit(2)
+    return names
+
+
 def main(argv: list | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    no_skip: list[str] = []
-    if "--no-skip" in argv:
-        no_skip = argv[argv.index("--no-skip") + 1:]
-    print(f"{'case':28s} {'result':6s} detail")
-    print("-" * 70)
     passed = 0
     extra = [("working_memory_compress", test_compression),
              ("audit_bare_number", test_audit_bare_number),
@@ -1249,6 +1286,7 @@ def main(argv: list | None = None) -> int:
              ("cache_hit_note", test_cache_hit_note),
              ("comment_bypass_sql", test_comment_bypass_sql),
              ("policy_single_statement", test_policy_single_statement),
+             ("no_skip_validation", test_no_skip_validation),
              ("mcp_guard_malformed", test_mcp_guard_malformed),
              ("mcp_guard_budget_charged", test_mcp_guard_budget_charged),
              ("concurrent_audit_writes", test_concurrent_audit_writes),
@@ -1278,6 +1316,9 @@ def main(argv: list | None = None) -> int:
              ("mcp_audit_truncated", test_mcp_audit_truncated),
              ("idempotency_key_dropped", test_idempotency_key_dropped)]
     total = len(CASES) + len(extra)
+    no_skip = _resolve_no_skip(argv, [name for name, _ in extra])
+    print(f"{'case':28s} {'result':6s} detail")
+    print("-" * 70)
     for case in CASES:
         ok, failures = run_case(case)
         status = "PASS" if ok else "FAIL"
