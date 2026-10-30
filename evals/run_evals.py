@@ -2,7 +2,10 @@
 scripted MockClient, then checks policy decisions, injection flags and
 artifacts. Prints a pass/fail table; exits non-zero on any failure.
 
-  python evals/run_evals.py
+  python evals/run_evals.py [--no-skip NAME ...]
+
+  --no-skip: evals that must not report SKIP (a SKIP counts as FAIL).
+  Used by CI for the live MCP evals, which must really run.
 """
 from __future__ import annotations
 
@@ -1228,7 +1231,11 @@ def test_idempotency_key_dropped() -> tuple[bool, str]:
     return True, ""
 
 
-def main() -> int:
+def main(argv: list | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    no_skip: list[str] = []
+    if "--no-skip" in argv:
+        no_skip = argv[argv.index("--no-skip") + 1:]
     print(f"{'case':28s} {'result':6s} detail")
     print("-" * 70)
     passed = 0
@@ -1284,8 +1291,11 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001 - a crashing test is a FAIL
             ok, detail = False, f"exception: {e}"
         if ok is None:
-            print(f"{name:28s} {'SKIP':6s} {detail}")
-            skipped += 1
+            if name in no_skip:
+                print(f"{name:28s} {'FAIL':6s} SKIP not allowed (--no-skip): {detail}")
+            else:
+                print(f"{name:28s} {'SKIP':6s} {detail}")
+                skipped += 1
         else:
             print(f"{name:28s} {'PASS' if ok else 'FAIL':6s} {detail}")
             passed += ok
