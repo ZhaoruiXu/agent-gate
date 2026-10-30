@@ -168,6 +168,18 @@ class PolicyEngine:
             self._per_tool = {}
             self._window_start = now
 
+    def charge_rejected_call(self, tool_name: str) -> None:
+        """Count a call rejected before decide() against the rate budget.
+
+        The MCP raw-argument guard rejects unknown tools / unknown keys
+        without calling decide(); without this, rejection spam would
+        never exhaust the budget. Mirrors the counter block in decide()."""
+        key = tool_name if isinstance(tool_name, str) else "<malformed>"
+        with self._lock:
+            self._maybe_reset_window()
+            self._total += 1
+            self._per_tool[key] = self._per_tool.get(key, 0) + 1
+
     def decide(self, tool: Tool, args: dict,
                actor: ActorContext | None = None) -> Decision:
         # Badly typed args must be a deny, never a crash: decide() runs

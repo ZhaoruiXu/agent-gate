@@ -561,6 +561,104 @@ def test_policy_single_statement() -> tuple[bool, str]:
     return True, ""
 
 
+def test_mcp_guard_malformed() -> tuple[bool, str]:
+    """Malformed tools/call envelopes must be clean isError rejections,
+    never a leaked Python exception, and they must be audited.
+    Regression: on mcp 2.3.0 the guard ran before the SDK validated the
+    envelope, so string arguments leaked "dictionary update sequence
+    element #0..." as JSON-RPC error code 0 with no audit entry."""
+    import asyncio
+    with tempfile.TemporaryDirectory(prefix="agent-gate-eval-") as tmp:
+        server = _load_server_with_env(tmp, {"AGENT_GATE_MCP_MODE": "strict"})
+        guard = server.middleware[0]
+
+        class FakeCtx:
+            def __init__(self, method, params):
+                self.method = method
+                self.params = params
+
+        async def fake_next(ctx):
+            raise AssertionError("malformed call reached the handler")
+
+        # arguments as a string: must not raise, clean isError instead
+        res = asyncio.run(guard(FakeCtx("tools/call", {
+            "name": "read_inbox", "arguments": "not-a-dict"}), fake_next))
+        if not res.get("isError"):
+            return False, "string arguments were not rejected"
+        text = res["content"][0]["text"]
+        if "dictionary update sequence" in text or "Traceback" in text:
+            return False, f"string arguments leaked internals: {text}"
+        if "Error executing tool" not in text:
+            return False, f"string-args denial missed the prefix: {text}"
+        # non-string name: must not raise "unhashable type"
+        res2 = asyncio.run(guard(FakeCtx("tools/call", {
+            "name": ["read_inbox"], "arguments": {}}), fake_next))
+        if not res2.get("isError"):
+            return False, "list name was not rejected"
+        text2 = res2["content"][0]["text"]
+        if "unhashable" in text2 or "Error executing tool" not in text2:
+            return False, f"list name leaked internals or missed prefix: {text2}"
+        # list-of-pairs arguments: rejected, not coerced into a dict
+        res3 = asyncio.run(guard(FakeCtx("tools/call", {
+            "name": "read_inbox", "arguments": [["n", 1]]}), fake_next))
+        if not res3.get("isError"):
+            return False, "list-of-pairs arguments were coerced instead of rejected"
+        # all three audited as malformed_call
+        entries = _audit_entries(tmp)
+        if sum(1 for e in entries if e["type"] == "malformed_call") != 3:
+            return False, "malformed calls were not all audited"
+        # arguments=None still means {} and passes through cleanly
+        seen = []
+
+        async def ok_next(ctx):
+            seen.append(ctx)
+            return {"ok": True}
+
+        res4 = asyncio.run(guard(FakeCtx("tools/call", {
+            "name": "read_inbox", "arguments": None}), ok_next))
+        if res4 != {"ok": True} or not seen:
+            return False, "arguments=None should pass through as {}"
+    return True, ""
+
+
+def test_mcp_guard_budget_charged() -> tuple[bool, str]:
+    """Guard rejections must count against the rate budget: after
+    enough unknown-tool rejections, a legitimate call is denied for
+    budget exceeded (previously the budget stayed fresh)."""
+    import asyncio
+    with tempfile.TemporaryDirectory(prefix="agent-gate-eval-") as tmp:
+        server = _load_server_with_env(tmp, {"AGENT_GATE_MCP_MODE": "strict"})
+        guard = server.middleware[0]
+        tools = server.tools
+
+        class FakeCtx:
+            def __init__(self, method, params):
+                self.method = method
+                self.params = params
+
+        async def fake_next(ctx):
+            raise AssertionError("rejected call reached the handler")
+
+        # 25 guard rejections against a budget of 20: each must stay a
+        # clean guard isError (not a crash), and never reach the tool.
+        for _ in range(25):
+            res = asyncio.run(guard(FakeCtx("tools/call", {
+                "name": "no_such_tool", "arguments": {}}), fake_next))
+            if not res.get("isError"):
+                return False, "guard rejection was not an error"
+            if "unknown tool" not in res["content"][0]["text"]:
+                return False, f"guard rejection changed shape: {res}"
+        # The next legitimate call must now be denied for budget.
+        try:
+            tools["read_inbox"](n=1)
+        except Exception as e:  # noqa: BLE001
+            if "budget exceeded" not in str(e):
+                return False, f"expected budget denial, got: {e}"
+        else:
+            return False, "budget was not exhausted by guard rejections"
+    return True, ""
+
+
 def test_recipient_display() -> tuple[bool, str]:
     """The approval prompt must show the recipient with repr(), so a
     carriage return cannot forge a different address on the terminal."""
@@ -1144,6 +1242,8 @@ def main() -> int:
              ("cache_hit_note", test_cache_hit_note),
              ("comment_bypass_sql", test_comment_bypass_sql),
              ("policy_single_statement", test_policy_single_statement),
+             ("mcp_guard_malformed", test_mcp_guard_malformed),
+             ("mcp_guard_budget_charged", test_mcp_guard_budget_charged),
              ("concurrent_audit_writes", test_concurrent_audit_writes),
              ("policy_role_normalisation", test_policy_role_normalisation),
              ("policy_budget_window", test_policy_budget_window),

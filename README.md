@@ -68,7 +68,7 @@ cp .env.example .env   # optional: add ANTHROPIC_API_KEY for a real model
 # show aggregated observability across runs (latency, cost, per-tool stats)
 .venv/bin/python -m agent_gate.cli metrics
 
-# run the eval suite (48 checks, no API key needed)
+# run the eval suite (50 checks, no API key needed)
 .venv/bin/python evals/run_evals.py
 
 # expose the tools as an MCP server (stdio) for Claude Code / Claude Desktop
@@ -81,9 +81,11 @@ cp .env.example .env   # optional: add ANTHROPIC_API_KEY for a real model
 # everything until restart. The SDK validates arguments against the tool
 # schema and silently drops unknown keys before our code runs, so a
 # raw-argument guard inspects the wire arguments first (middleware on
-# mcp 2.x, an overridden call_tool on 1.x): unknown tools and unknown
-# argument keys are rejected with isError and the raw arguments are
-# audited. Advertised schemas carry additionalProperties: false.
+# mcp 2.x, an overridden call_tool on 1.x): unknown tools, unknown
+# argument keys and malformed envelopes are rejected with isError
+# ("Error executing tool X:" prefix, like policy denials) and the raw
+# arguments are audited. Every rejection is charged to the rate budget.
+# Advertised schemas carry additionalProperties: false.
 .venv/bin/python -m agent_gate.server
 ```
 
@@ -203,6 +205,8 @@ how expensive".
 
 | `server_real_session` | real MCP ClientSession when mcp is installed, else SKIP (not PASS) | ✅ PASS |
 | `mcp_unknown_arg_rejected` | T10 regression: extra key over a real ClientSession is rejected with isError (not dropped), raw args audited, schema advertises additionalProperties:false, unknown tool audited; SKIP without mcp | ✅ PASS |
+| `mcp_guard_malformed` | malformed tools/call envelopes (string args, non-string name, list-of-pairs args) are clean isError rejections with the Error-executing prefix, never leaked Python exceptions, and audited | ✅ PASS |
+| `mcp_guard_budget_charged` | guard rejections count against the rate budget: 25 unknown-tool rejections exhaust the budget of 20, the next legitimate call is denied | ✅ PASS |
 | `policy_single_statement` | multi-statement SQL denied by policy itself (deny, not allow-then-error); trailing semicolon stays allowed | ✅ PASS |
 | `policy_unknown_arg` | unknown argument keys are denied by policy | ✅ PASS |
 | `approver_key_repr_and_to_full` | approval keys are repr()d, long recipient shown in full or denied over limit | ✅ PASS |
@@ -223,7 +227,7 @@ how expensive".
 | `delete_file_symlink_root` | delete under a symlinked root resolves both sides | ✅ PASS |
 | `scrub_value_narrow_to` | "to" kept only inside args; keys, sets and bytes scrubbed | ✅ PASS |
 
-48 checks, updated 2026-10-29 after the live MCP test round (raw-argument guard, unknown-tool audit, policy-level multi-statement SQL deny). The idempotency explicit-key feature was removed in an earlier round; see the idempotency section. The server tests run real MCP ClientSessions when the `mcp` package is installed (verified locally on mcp 1.30.0 and 2.3.0), and report SKIP when it is not.
+50 checks, updated 2026-10-29 after the live MCP test follow-ups (guard rejects malformed envelopes cleanly, guard rejections charge the rate budget, Error-executing prefix on guard denials). The idempotency explicit-key feature was removed in an earlier round; see the idempotency section. The server tests run real MCP ClientSessions when the `mcp` package is installed (verified locally on mcp 1.30.0 and 2.3.0), and report SKIP when it is not.
 
 ## Requirements
 

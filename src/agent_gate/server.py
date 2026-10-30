@@ -93,32 +93,58 @@ class _Gateway:
         self.actor = actor
 
     def check_raw_call(self, name, raw_args):
-        # type: (str | None, dict | None) -> str | None
+        # type: (object, object) -> str | None
         """Gate on the RAW wire arguments, before the SDK's validation.
 
         The SDK drops unknown argument keys during validation, so this
         must run first: anything the client sent that is not in the
         tool's schema is rejected here, loudly, instead of being
-        silently discarded. Returns an error string, or None when the
-        call may proceed. Rejections are audited WITH the raw arguments
-        the client sent, so the audit trail shows what was attempted.
+        silently discarded. Malformed envelopes (non-string name,
+        non-object arguments) are rejected too: on mcp 2.x the guard
+        runs before the SDK validates the envelope, and without this a
+        string argument would leak a Python ValueError ("dictionary
+        update sequence element #0...") as JSON-RPC error code 0 with
+        nothing audited.
+
+        Returns the client-facing isError text, or None when the call
+        may proceed. The text carries the same "Error executing tool
+        X:" prefix the SDK puts on policy denials. Every rejection is
+        charged to the policy rate budget (so rejection spam exhausts
+        it) and audited WITH the raw arguments the client sent, so the
+        audit trail shows what was attempted.
         """
+        if not isinstance(name, str):
+            self.policy.charge_rejected_call(name)
+            self.audit.record("malformed_call", {
+                "tool": name, "args": raw_args,
+                "reason": "tool name must be a string"})
+            return (f"Error executing tool {name!r}: "
+                    f"tool name must be a string")
+        if raw_args is not None and not isinstance(raw_args, dict):
+            self.policy.charge_rejected_call(name)
+            self.audit.record("malformed_call", {
+                "tool": name, "args": raw_args,
+                "reason": "arguments must be an object"})
+            return (f"Error executing tool {name}: arguments must be "
+                    f"an object, got {type(raw_args).__name__}")
         raw = dict(raw_args or {})
         tool = TOOLS.get(name)
         if tool is None:
+            self.policy.charge_rejected_call(name)
             self.audit.record("unknown_tool", {"tool": name, "args": raw})
-            return f"unknown tool: {name}"
+            return f"Error executing tool {name}: unknown tool"
         props = tool.parameters.get("properties", {})
         unknown = sorted(k for k in raw if k not in props)
         if unknown:
             reason = f"unknown argument(s): {[repr(k) for k in unknown]}"
+            self.policy.charge_rejected_call(name)
             self.audit.record("policy_decision", {
                 "tool": name, "args": raw,
                 "action": "deny", "reason": reason})
             self.audit.record("tool_result", {
                 "tool": name, "status": "denied",
                 "result": f"DENIED by policy: {reason}"})
-            return f"DENIED by policy: {reason}"
+            return f"Error executing tool {name}: DENIED by policy: {reason}"
         return None
 
     def run_tool(self, name, args):
@@ -187,7 +213,9 @@ class _RawCallGuard:
 
     async def __call__(self, ctx, call_next):  # type: ignore[no-untyped-def]
         if getattr(ctx, "method", None) == "tools/call":
-            params = getattr(ctx, "params", None) or {}
+            params = getattr(ctx, "params", None)
+            if not isinstance(params, dict):
+                params = {}
             err = self._gateway.check_raw_call(
                 params.get("name"), params.get("arguments"))
             if err is not None:
