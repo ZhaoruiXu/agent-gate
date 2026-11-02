@@ -16,7 +16,7 @@ it go rogue.
                            │ every tool call
               ┌────────────▼────────────┐
               │  policy engine          │── allow / prompt / deny
-              │  risk tiers + hard rules│── actor role gating
+              │  risk tiers + hard rules│── role-label gating
               │  low: read-only → auto  │   (intern: no high-risk)
               │  medium: writes → ask   │
               │  high: external → ask / │
@@ -52,7 +52,9 @@ it go rogue.
 
 ```bash
 cd agent-gate
-python3 -m venv .venv && .venv/bin/pip install -e .
+# Python >= 3.10 is required. macOS ships 3.9.6, which cannot install this
+# package; install 3.12 from python.org or Homebrew (brew install python@3.12).
+python3.12 -m venv .venv && .venv/bin/pip install -e .
 cp .env.example .env   # optional: add ANTHROPIC_API_KEY for a real model
 
 # scripted demo, no API key needed (shows approval + injection flagging)
@@ -114,15 +116,19 @@ output uses repr(), so control characters in a recipient cannot forge
 the displayed address. Over MCP, denied/errored calls raise, so MCP
 reports them with isError=True instead of as successful results.
 
-**Actor attribution + role gating.** `run_agent(..., actor="user@example.com")`
-(or `ActorContext(user_id, role)`, CLI: `--actor / --role`). Every audit
-entry carries the actor, so the trail answers *who* did what, not just what
-happened. Policy grades by role: `intern` is denied high-risk tools
-(send_email, delete_file) in every mode; `manager` / `admin` / `user`
-follow the normal mode logic. Note the tradeoff: the actor identifier is
-stored as given for attribution, unlike payloads which are PII-scrubbed —
-don't put secrets in `user_id`. An explicit `--role` without `--actor`
-is kept as an unknown user with that role, never silently dropped.
+**Role labels, not identity.** `run_agent(..., actor="user@example.com")`
+(or `ActorContext(user_id, role)`, CLI: `--actor / --role`, MCP:
+`AGENT_GATE_MCP_ACTOR` / `AGENT_GATE_MCP_ROLE`) attaches caller-supplied
+labels to every audit entry, and the policy grades by role label: `intern`
+is denied high-risk tools (send_email, delete_file) in every mode;
+`manager` / `admin` / `user` follow the normal mode logic. These labels are
+declared, not authenticated: anyone invoking the CLI or the MCP server can
+claim any actor or role, so this is not an identity layer. Verifying who the
+caller really is (authentication) is a separate layer above this harness and
+is not built here. Note the tradeoff: the actor identifier is stored as
+given for attribution, unlike payloads which are PII-scrubbed, so don't put
+secrets in `user_id`. An explicit `--role` without `--actor` is kept as an
+unknown user with that role, never silently dropped.
 
 **Tamper-evident audit log.** Each entry hash-chains to the previous one;
 `cli audit` runs verify(), which detects an edited entry and a seq gap. Args/results are
