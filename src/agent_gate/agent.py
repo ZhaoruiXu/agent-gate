@@ -96,6 +96,7 @@ class AnthropicClient:
             raise RuntimeError("ANTHROPIC_API_KEY is not set")
         self._client = Anthropic(api_key=api_key)
         self._model = model
+        self.last_usage = None  # set after each complete(); used by redteam cost tracking
 
     def complete(self, messages: list[dict], tools: list[dict]) -> ModelResponse:
         system, converted = "", []
@@ -122,6 +123,7 @@ class AnthropicClient:
             tools=[{"name": t["name"], "description": t["description"],
                     "input_schema": t["input_schema"]} for t in tools],
         )
+        self.last_usage = getattr(resp, "usage", None)
         text, calls = "", []
         for b in resp.content:
             if b.type == "text":
