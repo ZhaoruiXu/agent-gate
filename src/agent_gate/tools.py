@@ -9,6 +9,7 @@ Risk tiers:
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from dataclasses import dataclass, field
@@ -57,6 +58,12 @@ _FAKE_INBOX = [
 
 def _read_inbox(args: dict) -> list[dict]:
     n = min(int(args.get("n", 5)), 20)
+    # Test hook for the red-team harness: point at a JSON file to serve a
+    # custom inbox to the MCP server subprocess. Unset in normal use.
+    fixture = os.environ.get("AGENT_GATE_INBOX_JSON")
+    if fixture:
+        with open(fixture, encoding="utf-8") as f:
+            return json.load(f)[:n]
     return _FAKE_INBOX[:n]
 
 
