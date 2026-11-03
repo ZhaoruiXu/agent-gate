@@ -72,7 +72,7 @@ cp .env.example .env   # optional: add ANTHROPIC_API_KEY for a real model
 # show aggregated observability across runs (latency, cost, per-tool stats)
 .venv/bin/python -m agent_gate.cli metrics
 
-# run the eval suite (51 checks, no API key needed)
+# run the eval suite (58 checks, no API key needed)
 .venv/bin/python evals/run_evals.py
 
 # expose the tools as an MCP server (stdio) for Claude Code / Claude Desktop
