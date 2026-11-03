@@ -58,7 +58,7 @@ except ImportError:  # mcp 1.x
 from .agent import _truncate, detect_injection, new_run_id
 from .audit import AuditLog
 from .policy import ActorContext, PolicyEngine
-from .tools import TOOLS
+from .tools import TOOLS, caller_role, search_filtered
 
 _TYPE_MAP = {"string": str, "integer": int, "number": float, "boolean": bool}
 
@@ -170,7 +170,24 @@ class _Gateway:
             # with the reason in content (prefixed by the SDK).
             raise _ToolError(f"DENIED by policy: {decision.reason}")
         try:
-            result = tool.run(args)
+            # Role-aware tools (search_docs) read the caller role from ambient
+            # context. Use the raw role captured at server build, uncoerced:
+            # a missing or unknown role must default-deny to public documents
+            # only. Filtered-out doc ids are audited here and never returned
+            # to the model.
+            raw_role = getattr(self, "raw_role", None)
+            role_tok = caller_role.set(raw_role)
+            filt_tok = search_filtered.set([])
+            try:
+                result = tool.run(args)
+            finally:
+                caller_role.reset(role_tok)
+            doc_filtered = search_filtered.get() or []
+            search_filtered.reset(filt_tok)
+            if doc_filtered:
+                self.audit.record("doc_access_filtered", {
+                    "tool": tool.name, "role": raw_role,
+                    "filtered": doc_filtered})
             # Same injection handling as the agent loop: flag it in
             # the audit trail and warn the model, do not silently
             # pass tool output that looks like instructions through.
@@ -275,6 +292,11 @@ def _make_server():
         actor = ActorContext(user_id="unknown", role=role_env)
     audit = AuditLog(run_id=new_run_id(), actor=actor)
     gateway = _Gateway(policy, audit, actor)
+    # Raw role, uncoerced: role-aware tools (search_docs) must default-deny
+    # on a missing or unknown role, while ActorContext normalises unknown
+    # roles to "user". Captured here because the process env is the
+    # server's config surface; reading it per call would be racy.
+    gateway.raw_role = role_env
 
     if _MCP_MAJOR == 2:
         server = _Server("agent-gate-tools")

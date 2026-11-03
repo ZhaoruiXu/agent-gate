@@ -24,8 +24,8 @@ it go rogue.
               └────────────┬────────────┘
               ┌────────────▼────────────┐
               │  tool registry (MCP)    │── read_inbox · db_query ·
-              │  5 tools, sandboxed     │   write_file · delete_file ·
-              └────────────┬────────────┘   send_email
+              │  6 tools, sandboxed     │   write_file · delete_file ·
+              └────────────┬────────────┘   send_email · search_docs
                            │
               ┌────────────▼────────────┐
               │  audit log (hash-chained│── every turn, decision,
@@ -178,7 +178,7 @@ how expensive".
 
 ## Eval results
 
-`evals/run_evals.py` runs 51 checks (no API key needed):
+`evals/run_evals.py` runs 58 checks (no API key needed):
 
 | case | what it proves | result |
 |---|---|---|
@@ -235,8 +235,15 @@ how expensive".
 | `ro_connection_mode` | user query opens with uri=True and mode=ro | ✅ PASS |
 | `delete_file_symlink_root` | delete under a symlinked root resolves both sides | ✅ PASS |
 | `scrub_value_narrow_to` | "to" kept only inside args; keys, sets and bytes scrubbed | ✅ PASS |
+| `rag_cites_paragraph` | search_docs returns paragraph hits with doc/paragraph ids, best first | ✅ PASS |
+| `rag_role_filter_intern` | intern gets no_match on salary content; no id, title or number leaks | ✅ PASS |
+| `rag_empty_no_match` | zero-overlap query returns no_match, nothing fabricated | ✅ PASS |
+| `rag_injection_flagged` | injected paragraph retrieved over MCP gets the system note | ✅ PASS |
+| `rag_bm25_ranking` | BM25 ranks the relevant paragraph first, scores non-increasing | ✅ PASS |
+| `rag_filtered_audit_only` | filtered doc ids appear in audit only, never in payload or tool_result | ✅ PASS |
+| `rag_cli_actor_path` | CLI ActorContext path filters and audits the same way as MCP | ✅ PASS |
 
-51 checks, updated 2026-10-29 after the live MCP test follow-ups (guard rejects malformed envelopes cleanly, guard rejections charge the rate budget, Error-executing prefix on guard denials). The idempotency explicit-key feature was removed in an earlier round; see the idempotency section. The server tests run real MCP ClientSessions when the `mcp` package is installed (verified locally on mcp 1.30.0 and 2.3.0), and report SKIP when it is not.
+58 checks, updated 2026-11-02 (7 new role-filtered RAG evals). The idempotency explicit-key feature was removed in an earlier round; see the idempotency section. The server tests run real MCP ClientSessions when the `mcp` package is installed (verified locally on mcp 1.30.0 and 2.3.0), and report SKIP when it is not.
 
 ## Red-team (real-model injection tests)
 
@@ -331,6 +338,35 @@ Claude subscription; model IDs read back from the runs. The results file
   models only, driven by Claude Code (not bare-model results). This is
   not a "100% defense rate".
 
+## RAG (role-filtered doc search)
+
+The `search_docs` tool lets the agent answer from company documents instead
+of guessing: keyword search over a small demo doc set, returning
+paragraph-level hits with doc id, paragraph id and score.
+
+- Retrieval is hand-rolled BM25 (k1 1.5, b 0.75, stdlib only, no new
+  dependencies). A query that scores 0 against every paragraph comes back
+  as `no_match` with no hits.
+- Permissions are per document and checked before retrieval, with default
+  deny. Each document lists explicit `allowed_roles`; the token `"all"`
+  means every role, and no hierarchy is inferred. A missing or unknown
+  caller role only sees `"all"` documents.
+- Filtered-out documents are named in the audit trail
+  (`doc_access_filtered`) and never appear in the result the model sees,
+  so the model cannot learn that a restricted document exists from the
+  search itself.
+
+What this is not:
+
+- Semantic search. Paraphrases with no shared terms score 0. Embeddings
+  are a possible upgrade, deliberately not added (no new dependency).
+- Authenticated access control. Roles are caller-declared labels with no
+  authentication, the same known gap documented below: whoever can set
+  the role gets the documents.
+- A guarantee against hallucination. The system prompt tells the model to
+  cite doc and paragraph ids and to say it does not know when nothing
+  matches, but that is a prompt-level instruction, not an enforced check.
+
 ## Requirements
 
 Python >= 3.10 (see `pyproject.toml`, `requires-python = ">=3.10"`).
@@ -373,6 +409,7 @@ Python >= 3.10 (see `pyproject.toml`, `requires-python = ">=3.10"`).
 - PII scrubbing with Presidio instead of regexes; full RBAC matrix
   (per-tool role permissions, team scopes) beyond the intern/high-risk rule
 - Red-team eval set: more injection/JB exfiltration scenarios
+- Embedding-based retrieval for `search_docs` (replacing BM25)
 - Memory upgrade: embedding recall for episodic memory, TTL + conflict
   resolution for semantic facts
 

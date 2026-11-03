@@ -9,14 +9,40 @@ Risk tiers:
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 import sqlite3
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
 from . import paths
+from .demo_docs import DEMO_DOCS
+
+# Ambient caller role for the current tool invocation. The two dispatch
+# paths (the agent loop in agent.py, the MCP gateway in server.py) set it
+# around tool.run(); role-aware handlers (search_docs) read it. A value of
+# None means the role is missing or unknown, which is treated as
+# default-deny: only documents visible to every role are searched.
+caller_role: ContextVar = ContextVar("agent_gate_caller_role", default=None)
+
+# Doc ids filtered out by role during the current search_docs call. The
+# dispatch path records them in the audit trail; they are never returned
+# to the model, because returning the ids would leak that the documents
+# exist.
+search_filtered: ContextVar = ContextVar(
+    "agent_gate_search_filtered", default=None)
+
+# BM25 tuning and result caps, as named constants.
+BM25_K1 = 1.5
+BM25_B = 0.75
+DEFAULT_MAX_RESULTS = 3
+MAX_RESULTS_CAP = 10
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 
 @dataclass
@@ -180,6 +206,101 @@ def _send_email(args: dict) -> dict:
     return {"queued": True, "id": sum(1 for _ in open(outbox, encoding="utf-8"))}
 
 
+def _tokenize(text: str) -> list[str]:
+    return _TOKEN_RE.findall(text.lower())
+
+
+def _bm25_scores(query_terms: list[str],
+                 docs_terms: list[list[str]]) -> list[float]:
+    """Plain BM25 over token lists. Stdlib only, no embeddings."""
+    n = len(docs_terms)
+    if n == 0:
+        return []
+    doc_freq: dict[str, int] = {}
+    for terms in docs_terms:
+        for t in set(terms):
+            doc_freq[t] = doc_freq.get(t, 0) + 1
+    avg_len = sum(len(t) for t in docs_terms) / n
+    scores = []
+    for terms in docs_terms:
+        tf: dict[str, int] = {}
+        for t in terms:
+            tf[t] = tf.get(t, 0) + 1
+        doc_len = len(terms)
+        s = 0.0
+        for t in query_terms:
+            f = tf.get(t, 0)
+            if not f:
+                continue
+            df = doc_freq.get(t, 0)
+            idf = math.log(1 + (n - df + 0.5) / (df + 0.5))
+            denom = f + BM25_K1 * (1 - BM25_B + BM25_B * doc_len / avg_len)
+            s += idf * f * (BM25_K1 + 1) / denom
+        scores.append(s)
+    return scores
+
+
+def _role_visible_docs(role: str | None) -> tuple[list[dict], list[str]]:
+    """Split DEMO_DOCS into (visible, filtered) for a caller role.
+
+    No role hierarchy is inferred: a document is visible when its
+    allowed_roles contains the explicit "all" token or the role itself.
+    A missing or unknown role sees only "all" documents (default deny).
+    """
+    from .policy import ALLOWED_ROLES  # deferred: policy imports tools
+    known = role in ALLOWED_ROLES
+    visible, filtered = [], []
+    for doc in DEMO_DOCS:
+        allowed = doc["allowed_roles"]
+        if "all" in allowed or (known and role in allowed):
+            visible.append(doc)
+        else:
+            filtered.append(doc["id"])
+    return visible, filtered
+
+
+def _search_docs(args: dict) -> dict:
+    """Keyword search (BM25) over demo docs, filtered by caller role.
+
+    Returns paragraph-level hits with doc and paragraph ids. Filtered-out
+    doc ids are stashed in the search_filtered context var for the
+    dispatch path to audit; they never appear in the returned payload.
+    """
+    query = args.get("query", "")
+    if not isinstance(query, str):
+        query = ""
+    try:
+        max_results = int(args.get("max_results", DEFAULT_MAX_RESULTS))
+    except (TypeError, ValueError):
+        max_results = DEFAULT_MAX_RESULTS
+    max_results = max(1, min(max_results, MAX_RESULTS_CAP))
+
+    role = caller_role.get()
+    visible, filtered = _role_visible_docs(role)
+    cur = search_filtered.get()
+    if cur is not None:
+        cur.extend(filtered)
+
+    query_terms = _tokenize(query)
+    corpus = [(doc, para) for doc in visible for para in doc["paragraphs"]]
+    scores = _bm25_scores(query_terms, [_tokenize(p["text"]) for _, p in corpus])
+
+    # no_match is defined strictly: every paragraph scores 0.
+    if not scores or all(s == 0 for s in scores):
+        return {"role": role if role is not None else "public",
+                "query": query, "hits": [], "no_match": True}
+
+    ranked = sorted(zip(scores, corpus), key=lambda x: x[0], reverse=True)
+    hits = [{"doc_id": doc["id"],
+             "paragraph_id": para["id"],
+             "title": doc["title"],
+             "text": para["text"],
+             "score": round(score, 4)}
+            for score, (doc, para) in ranked[:max_results] if score > 0]
+    return {"role": role if role is not None else "public",
+            "query": query, "hits": hits, "no_match": not hits}
+
+
 TOOLS: dict[str, Tool] = {}
 
 
@@ -234,6 +355,19 @@ _register(Tool(
                                "body": {"type": "string"}},
                 "required": ["to", "subject", "body"]},
     handler=_send_email,
+))
+_register(Tool(
+    name="search_docs",
+    description=("Keyword search (BM25) over company documents. "
+                "Role-filtered: only documents your role may see are searched. "
+                "Read-only."),
+    risk="low",
+    parameters={"type": "object",
+                "properties": {"query": {"type": "string"},
+                               "max_results": {"type": "integer",
+                                               "default": DEFAULT_MAX_RESULTS}},
+                "required": ["query"]},
+    handler=_search_docs,
 ))
 
 

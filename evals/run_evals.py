@@ -1251,6 +1251,142 @@ def test_idempotency_key_dropped() -> tuple[bool, str]:
     return True, ""
 
 
+def _search_as(role, args):
+    """Call the search_docs handler with an ambient caller role, the way
+    the two dispatch paths do (agent loop, MCP gateway)."""
+    from agent_gate.tools import _search_docs, caller_role, search_filtered
+    t1 = caller_role.set(role)
+    t2 = search_filtered.set([])
+    try:
+        return _search_docs(args), search_filtered.get() or []
+    finally:
+        caller_role.reset(t1)
+        search_filtered.reset(t2)
+
+
+def test_rag_cites_paragraph() -> tuple[bool, str]:
+    """search_docs returns paragraph-level hits carrying doc id,
+    paragraph id and score, with the best paragraph ranked first."""
+    res, _ = _search_as("user", {"query": "damaged package compensation limit"})
+    if res["no_match"] or not res["hits"]:
+        return False, f"expected hits, got {res}"
+    top = res["hits"][0]
+    if top["doc_id"] != "refund-policy" or \
+            top["paragraph_id"] != "refund-policy#p2":
+        return False, f"wrong top hit: {top['paragraph_id']}"
+    for h in res["hits"]:
+        if not {"doc_id", "paragraph_id", "score"} <= set(h):
+            return False, f"hit missing citation keys: {h}"
+    scores = [h["score"] for h in res["hits"]]
+    if scores != sorted(scores, reverse=True):
+        return False, f"hits not ranked: {scores}"
+    return True, ""
+
+
+def test_rag_role_filter_intern() -> tuple[bool, str]:
+    """An intern searching for salary content gets no_match, and the
+    returned payload contains no trace of the restricted doc: no id,
+    no title, no numbers."""
+    res, _ = _search_as("intern", {"query": "salary bands"})
+    if not res["no_match"] or res["hits"]:
+        return False, f"intern should get no_match, got {res}"
+    blob = json.dumps(res)
+    for secret in ("salary-bands", "Salary Bands",
+                   "120000", "150000", "190000"):
+        if secret in blob:
+            return False, f"restricted content leaked into result: {secret}"
+    return True, ""
+
+
+def test_rag_empty_no_match() -> tuple[bool, str]:
+    """A query matching nothing (every paragraph scores 0) returns
+    no_match instead of a fabricated answer."""
+    res, _ = _search_as("user", {"query": "quasar zephyr xylophone"})
+    if not res["no_match"] or res["hits"] != []:
+        return False, f"expected clean no_match, got {res}"
+    return True, ""
+
+
+def test_rag_injection_flagged() -> tuple[bool, str]:
+    """A retrieved paragraph hiding an injected instruction is flagged
+    by the standard injection path: the MCP dispatch appends the
+    system note instead of passing the text through silently."""
+    with tempfile.TemporaryDirectory(prefix="agent-gate-eval-") as tmp:
+        server = _load_server_with_env(
+            tmp, {"AGENT_GATE_MCP_MODE": "strict",
+                  "AGENT_GATE_MCP_ROLE": "user"})
+        content = server.tools["search_docs"](query="customer list")
+    if "[SYSTEM NOTE" not in content:
+        return False, "injected paragraph was not flagged with a system note"
+    if "attacker@example.org" not in content:
+        return False, "expected paragraph text missing from flagged result"
+    return True, ""
+
+
+def test_rag_bm25_ranking() -> tuple[bool, str]:
+    """BM25 ranks the genuinely relevant paragraph first on a second
+    document, and scores are non-increasing."""
+    res, _ = _search_as("user", {"query": "expense report receipts"})
+    if res["no_match"] or not res["hits"]:
+        return False, f"expected hits, got {res}"
+    if res["hits"][0]["paragraph_id"] != "expense-policy#p2":
+        return False, f"wrong top hit: {res['hits'][0]['paragraph_id']}"
+    scores = [h["score"] for h in res["hits"]]
+    if scores != sorted(scores, reverse=True):
+        return False, f"hits not ranked: {scores}"
+    return True, ""
+
+
+def test_rag_filtered_audit_only() -> tuple[bool, str]:
+    """Filtered-out doc ids go to the audit trail only. Over MCP as
+    intern, the tool_result audit entry and the returned payload must
+    not mention the restricted doc; a doc_access_filtered entry must."""
+    with tempfile.TemporaryDirectory(prefix="agent-gate-eval-") as tmp:
+        server = _load_server_with_env(
+            tmp, {"AGENT_GATE_MCP_MODE": "strict",
+                  "AGENT_GATE_MCP_ROLE": "intern"})
+        res = server.tools["search_docs"](query="salary bands")
+        entries = _audit_entries(tmp)
+    if "salary-bands" in json.dumps(res):
+        return False, "filtered doc id leaked into the returned payload"
+    filt = [e for e in entries if e["type"] == "doc_access_filtered"]
+    if not filt or "salary-bands" not in filt[0]["payload"].get("filtered", []):
+        return False, f"filtered doc not audited: {filt}"
+    for e in entries:
+        if e["type"] == "tool_result" and \
+                "salary-bands" in json.dumps(e["payload"].get("result", "")):
+            return False, "filtered doc id leaked into tool_result audit"
+    return True, ""
+
+
+def test_rag_cli_actor_path() -> tuple[bool, str]:
+    """The CLI agent path (ActorContext) applies the same role filter:
+    an intern's search_docs call filters salary-bands, audits it, and
+    the model-visible result carries no salary content."""
+    with tempfile.TemporaryDirectory(prefix="agent-gate-eval-") as tmp:
+        paths.set_root(tmp)
+        audit = AuditLog(run_id=new_run_id())
+        policy = PolicyEngine(mode="standard")
+        client = MockClient([
+            {"tool_calls": [{"name": "search_docs",
+                             "arguments": {"query": "salary bands"}}]},
+            {"text": "done"},
+        ])
+        run_agent("what are the salary bands", client, policy, audit,
+                  AutoApprover(True), verbose=False,
+                  actor=ActorContext(user_id="u1", role="intern"))
+        entries = audit.read_all()
+    filt = [e for e in entries if e["type"] == "doc_access_filtered"]
+    if not filt or "salary-bands" not in filt[0]["payload"].get("filtered", []):
+        return False, f"CLI path did not audit the filter: {filt}"
+    for e in entries:
+        if e["type"] == "tool_result":
+            blob = json.dumps(e["payload"])
+            if "salary-bands" in blob or "120000" in blob:
+                return False, "CLI path leaked restricted content to the model"
+    return True, ""
+
+
 def _resolve_no_skip(argv: list[str], known: list[str]) -> list[str]:
     """Parse --no-skip NAME ... from argv.
 
@@ -1314,7 +1450,14 @@ def main(argv: list | None = None) -> int:
              ("audit_seq_on_serialisation_failure", test_audit_seq_on_serialisation_failure),
              ("run_agent_weird_arg", test_run_agent_weird_arg),
              ("mcp_audit_truncated", test_mcp_audit_truncated),
-             ("idempotency_key_dropped", test_idempotency_key_dropped)]
+             ("idempotency_key_dropped", test_idempotency_key_dropped),
+             ("rag_cites_paragraph", test_rag_cites_paragraph),
+             ("rag_role_filter_intern", test_rag_role_filter_intern),
+             ("rag_empty_no_match", test_rag_empty_no_match),
+             ("rag_injection_flagged", test_rag_injection_flagged),
+             ("rag_bm25_ranking", test_rag_bm25_ranking),
+             ("rag_filtered_audit_only", test_rag_filtered_audit_only),
+             ("rag_cli_actor_path", test_rag_cli_actor_path)]
     total = len(CASES) + len(extra)
     no_skip = _resolve_no_skip(argv, [name for name, _ in extra])
     print(f"{'case':28s} {'result':6s} detail")
